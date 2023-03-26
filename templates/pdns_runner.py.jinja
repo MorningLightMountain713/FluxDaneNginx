@@ -1,0 +1,94 @@
+from dataclasses import dataclass, field
+
+from fluxvault.log import log
+from rich.pretty import pretty_repr
+
+import powerdns
+
+from pdns import plugin
+
+PDNS_API = "{{pdns_api_endpoint}}"
+PDNS_KEY = "{{pdns_key}}"
+
+@dataclass
+class RRSet:
+    name: str
+    rtype: str
+    records: field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, target: dict):
+        return RRSet(**target)
+
+    def encode(self):
+        return self.__dict__
+
+api_client = powerdns.PDNSApiClient(api_endpoint=PDNS_API, api_key=PDNS_KEY)
+api = powerdns.PDNSEndpoint(api_client)
+
+@plugin.create
+def list_records(zone_name: str) -> list:
+    zone = api.servers[0].get_zone(zone_name)
+    return zone.details["rrsets"]
+
+@plugin.create
+def remove_records(zone_name: str, rrsets: list[dict]):
+    zone = api.servers[0].get_zone(zone_name)
+
+    log.info(f"Removing the following records from these RRSets: {pretty_repr(rrsets)}")
+
+    rrsets_to_update = []
+    for rrset in rrsets:
+        rrset = RRSet.from_dict(rrset)
+        existing_rrset = next(iter(filter(lambda x: x.get("type") == rrset.rtype and x.get("name") == rrset.name, zone.details["rrsets"])), {})
+        rrset.records = [(x, False) for x in rrset.records]
+
+        records = []
+        if existing_rrset:
+            records = existing_rrset.get("records")
+            records = [tuple(x.values()) for x in records]
+        else:
+            continue
+
+        log.info(f"All existing formatted records: {pretty_repr(records)}")
+
+        for record in rrset.records:
+            print(record)
+            try:
+                records.remove(record)
+            except:
+                pass
+
+        log.info(f"Remaning records after filtering: {pretty_repr(records)}")
+        if records:
+            rrsets_to_update.append(powerdns.RRSet(name=rrset.name, rtype=rrset.rtype, records=records, ttl=300))
+        else:
+            zone.delete_records([powerdns.RRSet(name=rrset.name, rtype=rrset.rtype, records=existing_rrset.get("records"))])
+            continue
+
+    if rrsets_to_update:
+        zone.create_records(rrsets_to_update)
+
+@plugin.create
+def add_records(zone_name: str, rrsets: list[dict]):
+    zone = api.servers[0].get_zone(zone_name)
+
+    log.info(f"Adding RRSets: {pretty_repr(rrsets)}")
+
+    new_rrsets = []
+    for rrset in rrsets:
+        rrset = RRSet.from_dict(rrset)
+
+        existing = list(filter(lambda x: x.get("type") == rrset.rtype and x.get("name") == rrset.name, zone.details["rrsets"]))
+
+        records = []
+        if existing:
+            records = existing[0].get("records")
+            records = [tuple(x.values()) for x in records]
+
+        new_records = [(x, False) for x in rrset.records]
+        records.extend(new_records)
+
+        new_rrsets.append(powerdns.RRSet(name=rrset.name, rtype=rrset.rtype, records=records, ttl=300))
+
+    zone.create_records(new_rrsets)

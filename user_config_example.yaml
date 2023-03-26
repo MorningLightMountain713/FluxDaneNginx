@@ -1,0 +1,17 @@
+---
+pdns_api_endpoint: http://127.0.0.1:8081/api/v1
+pdns_key: <your pdns key from /etc/powerdns/pdns.conf>
+
+# this runs on your dns server (not Flux)
+dns_app_name: DNSdriver
+dns_server_ips: [your server ip string here]
+dns_server_comms_port: 8888
+
+# this is your flux app. The app name is whatever you call your app in flux
+# When you name the components, call them proxy and webserver
+nginx_app_name: <your app name>
+nginx_app_comms_port: 33333
+handshake_domain: <your handshake name>
+# this is the port your have open on the proxy
+tls_port: 33443
+proxy_target: http://fluxwebserver_<your app name>:3000
