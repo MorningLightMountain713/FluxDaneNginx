@@ -19,6 +19,7 @@ from fluxvault.helpers import (
 from fluxvault.log import log
 from ownca.exceptions import OwnCAInvalidCertificate
 from rich.pretty import pretty_repr
+from copy import deepcopy
 
 
 @dataclass
@@ -186,6 +187,93 @@ class DaneRunner:
         # If we've just started and we have existing file, give nodes the benefit of the doubt
         # self.active_nginx_nodes.add(agent_id)
 
+    def deep_diff(self, x, y, parent_key=None, exclude_keys=[], epsilon_keys=[]):
+        """
+        Take the deep diff of JSON-like dictionaries
+
+        No warranties when keys, or values are None
+
+        """
+        EPSILON = 0.5
+        rho = 1 - EPSILON
+
+        if x == y:
+            return None
+
+        if parent_key in epsilon_keys:
+            xfl, yfl = self.float_or_None(x), self.float_or_None(y)
+            if xfl and yfl and xfl * yfl >= 0 and rho * xfl <= yfl and rho * yfl <= xfl:
+                return None
+
+        if type(x) != type(y) or type(x) not in [list, dict]:
+            return x, y
+
+        if type(x) == dict:
+            d = {}
+            for k in x.keys() ^ y.keys():
+                if k in exclude_keys:
+                    continue
+                if k in x:
+                    d[k] = (deepcopy(x[k]), None)
+                else:
+                    d[k] = (None, deepcopy(y[k]))
+
+            for k in x.keys() & y.keys():
+                if k in exclude_keys:
+                    continue
+
+                next_d = self.deep_diff(
+                    x[k],
+                    y[k],
+                    parent_key=k,
+                    exclude_keys=exclude_keys,
+                    epsilon_keys=epsilon_keys,
+                )
+                if next_d is None:
+                    continue
+
+                d[k] = next_d
+
+            return d if d else None
+
+        # assume a list:
+        d = [None] * max(len(x), len(y))
+        flipped = False
+        if len(x) > len(y):
+            flipped = True
+            x, y = y, x
+
+        for i, x_val in enumerate(x):
+            d[i] = (
+                self.deep_diff(
+                    y[i],
+                    x_val,
+                    parent_key=i,
+                    exclude_keys=exclude_keys,
+                    epsilon_keys=epsilon_keys,
+                )
+                if flipped
+                else self.deep_diff(
+                    x_val,
+                    y[i],
+                    parent_key=i,
+                    exclude_keys=exclude_keys,
+                    epsilon_keys=epsilon_keys,
+                )
+            )
+
+        for i in range(len(x), len(y)):
+            d[i] = (y[i], None) if flipped else (None, y[i])
+
+        return None if all(map(lambda x: x is None, d)) else d
+
+    @staticmethod
+    def float_or_None(x):
+        try:
+            return float(x)
+        except ValueError:
+            return None
+
     @staticmethod
     def key_by_value(subject: dict, value):
         for k, v in subject.items():
@@ -254,12 +342,73 @@ class DaneRunner:
 
         return to_remove
 
+    async def sync_dns_server(self, dns_server_id: tuple, rrsets: dict) -> dict:
+        dns_tasks = {dns_server_id: []}
+
+        # this will only be false if the server didn't respond
+        tsla_name = f"_{self.tls_port}._tcp.{self.zone_name}"
+
+        tlsa_rrset = next(
+            filter(
+                lambda x: x["name"] == tsla_name and x["type"] == "TLSA",
+                rrsets,
+            ),
+            {},
+        )
+        a_rrset = next(
+            filter(
+                lambda x: x["name"] == self.zone_name and x["type"] == "A",
+                rrsets,
+            ),
+            {},
+        )
+
+        tlsa_records = tlsa_rrset.get("records", [])
+        a_records = a_rrset.get("records", [])
+
+        tlsa_to_remove = self.filter_unknown_records(
+            dns_server_id, "tlsa", tlsa_records
+        )
+        a_to_remove = self.filter_unknown_records(dns_server_id, "a", a_records)
+
+        tlsa_to_add = self.filter_missing_records(dns_server_id, "tlsa", tlsa_records)
+        a_to_add = self.filter_missing_records(dns_server_id, "a", a_records)
+
+        log.info(f"Unknown A records to remove: {pretty_repr(a_to_remove)}")
+        log.info(f"Unknown TLSA records to remove: {pretty_repr(tlsa_to_remove)}")
+
+        if a_to_remove or tlsa_to_remove:
+            dns_remove_task = self.dnsdriver.build_task(
+                "remove_agents_dns_records",
+                [
+                    self.zone_name,
+                    self.tls_port,
+                    tlsa_to_remove,
+                    a_to_remove,
+                ],
+            )
+            dns_tasks[dns_server_id].append(dns_remove_task)
+
+        log.info(f"A records to add: {pretty_repr(a_to_add)}")
+        log.info(f"TLSA records to add: {pretty_repr(tlsa_to_add)}")
+
+        if a_to_add or tlsa_to_add:
+            dns_add_task = self.dnsdriver.build_task(
+                "add_agents_dns_records",
+                [self.zone_name, self.tls_port, tlsa_to_add, a_to_add],
+            )
+            dns_tasks[dns_server_id].append(dns_add_task)
+
+        return dns_tasks
+
     async def run_forever(self):
         await self.danenginx.start_polling_fluxnode_ips()
         # this isn't actually a fluxapp, just a powerdns server running the agent. (see dns_app_config)
         await self.dnsdriver.start_polling_fluxnode_ips()
 
         while True:
+            prior_state = deepcopy(self.record_map)
+
             dns_states: dict = await self.dnsdriver.run_agents_async(
                 [self.dnsdriver.build_task("get_agents_state")], stay_connected=True
             )
@@ -322,66 +471,13 @@ class DaneRunner:
                 if rrsets := results.get(
                     "get_agents_dns_records", None
                 ):  # this will only be false if the server didn't respond
-                    tsla_name = f"_{self.tls_port}._tcp.{self.zone_name}"
+                    dns_sync_tasks = await self.sync_dns_server(dns_server_id, rrsets)
+                    dns_agents_tasks.update(dns_sync_tasks)
 
-                    tlsa_rrset = next(
-                        filter(
-                            lambda x: x["name"] == tsla_name and x["type"] == "TLSA",
-                            rrsets,
-                        ),
-                        {},
-                    )
-                    a_rrset = next(
-                        filter(
-                            lambda x: x["name"] == self.zone_name and x["type"] == "A",
-                            rrsets,
-                        ),
-                        {},
-                    )
-
-                    tlsa_records = tlsa_rrset.get("records", [])
-                    a_records = a_rrset.get("records", [])
-
-                    tlsa_to_remove = self.filter_unknown_records(
-                        dns_server_id, "tlsa", tlsa_records
-                    )
-                    a_to_remove = self.filter_unknown_records(
-                        dns_server_id, "a", a_records
-                    )
-
-                    tlsa_to_add = self.filter_missing_records(
-                        dns_server_id, "tlsa", tlsa_records
-                    )
-                    a_to_add = self.filter_missing_records(
-                        dns_server_id, "a", a_records
-                    )
-
-                    log.info(f"Unknown A records to remove: {pretty_repr(a_to_remove)}")
-                    log.info(
-                        f"Unknown TLSA records to remove: {pretty_repr(tlsa_to_remove)}"
-                    )
-
-                    if a_to_remove or tlsa_to_remove:
-                        dns_remove_task = self.dnsdriver.build_task(
-                            "remove_agents_dns_records",
-                            [
-                                self.zone_name,
-                                self.tls_port,
-                                tlsa_to_remove,
-                                a_to_remove,
-                            ],
-                        )
-                        dns_agents_tasks[dns_server_id].append(dns_remove_task)
-
-                    log.info(f"A records to add: {pretty_repr(a_to_add)}")
-                    log.info(f"TLSA records to add: {pretty_repr(tlsa_to_add)}")
-
-                    if a_to_add or tlsa_to_add:
-                        dns_add_task = self.dnsdriver.build_task(
-                            "add_agents_dns_records",
-                            [self.zone_name, self.tls_port, tlsa_to_add, a_to_add],
-                        )
-                        dns_agents_tasks[dns_server_id].append(dns_add_task)
+            state_diff = self.deep_diff(prior_state, self.record_map)
+            log.info(f"State diff: {pretty_repr(state_diff)}")
+            # if compare maps(prior, self.record_map)
+            # resolve differences, build tasks
 
             certs: dict[tuple, str] = {}
             for agent_id, results in nginx_task_results.items():
@@ -408,6 +504,7 @@ class DaneRunner:
                         self.danenginx.build_task("start_agents_nginx")
                     ]
 
+                # GATHER
                 await self.danenginx.run_agents_async(targets=nginx_agents_tasks)
 
             if any(dns_agents_tasks.values()):
@@ -624,3 +721,4 @@ class DaneRunner:
                 await self.dnsdriver.disconnect_agent_by_id(agent_id)
 
         return tasks, time_since_last_sync
+
