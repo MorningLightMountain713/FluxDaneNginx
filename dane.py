@@ -35,9 +35,6 @@ CONTACT_SCHEDULE = 60  # seconds
 SYNC_OBJECTS_SCHEDULE = 5 * CONTACT_SCHEDULE
 AGENT_ID_TO_TLSA_FILE = Path(".dane_tlsa_address_mapping")
 
-PDNS_API = "http://127.0.0.1:8081/api/v1"
-PDNS_KEY = "KBMVSTHlhqb7HE5/VVs5fxH2QRU6DweQ"
-
 nginx_extensions = FluxVaultExtensions()
 dns_extensions = FluxVaultExtensions()
 
