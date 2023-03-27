@@ -10,8 +10,12 @@ from cryptography.x509.oid import NameOID
 from fluxrpc.client import RPCClient
 from fluxvault import FluxAppManager, FluxKeeper
 from fluxvault.extensions import FluxVaultExtensions
-from fluxvault.helpers import (ContainerState, FluxTask, FluxVaultContext,
-                               manage_transport)
+from fluxvault.helpers import (
+    ContainerState,
+    FluxTask,
+    FluxVaultContext,
+    manage_transport,
+)
 from fluxvault.log import log
 from ownca.exceptions import OwnCAInvalidCertificate
 from rich.pretty import pretty_repr
