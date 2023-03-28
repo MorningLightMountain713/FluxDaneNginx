@@ -1,11 +1,15 @@
 import asyncio
+import hashlib
 import pickle
 import shutil
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable
 
 import cryptography
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.x509.oid import NameOID
 from fluxrpc.client import RPCClient
 from fluxvault import FluxAppManager, FluxKeeper
@@ -19,7 +23,6 @@ from fluxvault.helpers import (
 from fluxvault.log import log
 from ownca.exceptions import OwnCAInvalidCertificate
 from rich.pretty import pretty_repr
-from copy import deepcopy
 
 
 @dataclass
@@ -284,22 +287,16 @@ class DaneRunner:
     async def generate_tlsa(cert_str: str) -> str:
         """Takes a cert as a string, and returns a tlsa record in 3 1 1 format"""
 
-        # use pyca/cryptography instead of this tomfoolery
-
-        cmd = f'echo "{cert_str}" | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | xxd  -p -u -c 32'
-
-        proc = await asyncio.create_subprocess_shell(
-            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        # should be hashing whole cert, not just pubkey
+        cert = x509.load_pem_x509_certificate(bytes(cert_str, encoding="utf-8"))
+        pubkey = cert.public_key()
+        pubkey_bytes = pubkey.public_bytes(
+            Encoding.DER, PublicFormat.SubjectPublicKeyInfo
         )
+        # der_certbytes = cert.public_bytes(Encoding.DER)
+        digest = hashlib.sha256(pubkey_bytes).hexdigest()
 
-        stdout, stderr = await proc.communicate()
-        if stderr:
-            print("error running subcommand")
-            print(stderr)
-            return ""
-
-        stdout = stdout.decode().strip("\n")
-        return f"3 1 1 {stdout}".lower()
+        return f"3 1 1 {digest}".lower()
 
     async def task_and_state_resolver(
         self, states: dict, task_resolver: Awaitable
@@ -721,4 +718,3 @@ class DaneRunner:
                 await self.dnsdriver.disconnect_agent_by_id(agent_id)
 
         return tasks, time_since_last_sync
-
