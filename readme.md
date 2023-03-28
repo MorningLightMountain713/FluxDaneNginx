@@ -4,7 +4,7 @@ Run full TLS connections without a CA! DNSSEC.
 
 ## Compatibility note
 
-This has only been tested on macOS. Should work on other platforms too. The tlsa record generation is using a hack which relies on openssl right now. So this needs to be in your path. ( will rewrite to use native python soon )
+This has only been tested on macOS and Ubuntu. Should work on other platforms too. For Ubuntu, you will need to install a keychain backend - https://pypi.org/project/keyrings.cryptfile/ has been tested and working.
 
 ## Minimum requirements
 
@@ -12,7 +12,7 @@ This has only been tested on macOS. Should work on other platforms too. The tlsa
 * Minimum one server with great uptime and static IP. Better to split the DNS / keeper though
 * FluxApp running with FluxVault image in agent configuration
 * A way of resolving handshake domains in your browser. A great app: https://github.com/imperviousinc/fingertip
-* Python 3.11. The install process for this on Windows and Mac is pretty straightforward. See https://www.python.org/downloads/release/python-3112/ Just make sure you run the scripts after to update your path and restart your terminal. If this is an issue for you, as long as you have Docker installed, you can just run the `Keeper` as an image.
+* Python 3.11. The install process for this on Windows, Ubuntu and Mac is pretty straightforward. See https://www.python.org/downloads/release/python-3112/ Just make sure you run the scripts after to update your path and restart your terminal. If this is an issue for you, as long as you have Docker installed, you can just run the `Keeper` as an image.
 
 ## Optional requirements
 
