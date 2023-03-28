@@ -284,11 +284,11 @@ class DaneRunner:
                 return k
 
     @staticmethod
-    async def generate_tlsa(cert_str: str) -> str:
-        """Takes a cert as a string, and returns a tlsa record in 3 1 1 format"""
+    async def generate_tlsa(cert_bytes: bytes) -> str:
+        """Takes a cert, and returns a tlsa record in 3 1 1 format"""
 
         # should be hashing whole cert, not just pubkey
-        cert = x509.load_pem_x509_certificate(bytes(cert_str, encoding="utf-8"))
+        cert = x509.load_pem_x509_certificate(cert_bytes)
         pubkey = cert.public_key()
         pubkey_bytes = pubkey.public_bytes(
             Encoding.DER, PublicFormat.SubjectPublicKeyInfo
@@ -551,7 +551,7 @@ class DaneRunner:
         tasks = []
 
         for agent_id, cert in certs.items():
-            tlsa = await self.generate_tlsa(cert.decode())
+            tlsa = await self.generate_tlsa(cert)
             tlsa_to_add.append(tlsa)
 
             # Node has just restarted? (Validate this) If this happens, we only need to reload the tlsa, a remains the same

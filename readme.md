@@ -38,7 +38,7 @@ Point your handshake domain to your NameServers. This can take 6 hours or so to 
 
 ### Step two
 
-Generate an auth key with the `Keeper`. This stores the private key in your secure area, then gives you the address - this is passed into the FluxApp at runtime, this allows the FluxApp to validate via message signing that we are indeed who we say we are. This is far superior to any souce address based validation. Run:
+Generate an auth key with the `Keeper`. This stores the private key in your secure area, then gives you the address - this is passed into the FluxApp at runtime, this allows the FluxApp to validate via message signing that we are indeed who we say we are. This is far superior to any source address based validation. Run:
 
 ```
 > fluxvault keeper keys create

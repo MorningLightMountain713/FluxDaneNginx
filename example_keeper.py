@@ -2,10 +2,8 @@ import asyncio
 from pathlib import Path
 
 import yaml
-from fluxvault import FluxAppManager, FluxKeeper
+from fluxvault import FluxAppManager, FluxKeeper, AppMode
 
-# this will be imported globally in next release
-from fluxvault.helpers import AppMode
 from jinja2 import Environment, FileSystemLoader
 
 from dane import DaneRunner, dns_extensions, nginx_extensions
