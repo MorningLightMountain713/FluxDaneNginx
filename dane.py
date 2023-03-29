@@ -398,175 +398,181 @@ class DaneRunner:
 
         return dns_tasks
 
+    async def get_states(self) -> tuple[dict, dict]:
+        dns_states: dict = await self.dnsdriver.run_agents_async(
+            [self.dnsdriver.build_task("get_agents_state")], stay_connected=True
+        )
+        dane_states: dict = await self.danenginx.run_agents_async(
+            [self.danenginx.build_task("get_agents_state")], stay_connected=True
+        )
+
+        # test what happens if dns not connected, do we just store in record map and wait?
+        log.info(f"DNS states: {pretty_repr(dns_states)}")
+        log.info(f"Nginx states: {pretty_repr(dane_states)}")
+
+        return dns_states, dane_states
+
+    async def resolve_dns_agents_state(
+        self, task_results: dict
+    ) -> dict[tuple, list[FluxTask]]:
+        # filter powerdns server(s) state for our rrsets, validate against local state (self.record_map)
+        dns_agents_tasks: dict[tuple, list[FluxTask]] = {}
+        for (
+            dns_server_id,
+            results,
+        ) in task_results.items():  # I've only tested on 1 dns server at a time
+            if dns_server_id not in self.record_map:
+                self.record_map[dns_server_id] = {"a": {}, "tlsa": {}}
+
+            dns_agents_tasks[dns_server_id]: list[FluxTask] = []
+
+            nodes_to_remove = set()
+            for records_by_type in self.record_map[dns_server_id].values():
+                for agent_id in list(records_by_type):
+                    if agent_id not in self.all_nginx_nodes:
+                        nodes_to_remove.add(agent_id)
+
+            a_to_remove = tlsa_to_remove = []
+            for node_to_remove in nodes_to_remove:
+                log.warning(
+                    f"Removing node {node_to_remove} as it's not in All Nginx nodes group"
+                )
+
+                self.active_nginx_nodes.discard(node_to_remove)
+
+                tlsa_to_remove.append(
+                    self.record_map[dns_server_id]["tlsa"].pop(node_to_remove, None)
+                )
+                a_to_remove.append(
+                    self.record_map[dns_server_id]["a"].pop(node_to_remove, None)
+                )
+                self.uncontactable_count.pop(node_to_remove, None)
+                # remove from record map, remove from dns, check self.uncontactable_count[agent_id] and remove from there too
+
+            tlsa_to_remove = list(filter(None, tlsa_to_remove))
+            a_to_remove = list(filter(None, a_to_remove))
+
+            if a_to_remove or tlsa_to_remove:
+                dns_remove_task = self.dnsdriver.build_task(
+                    "remove_agents_dns_records",
+                    [
+                        self.zone_name,
+                        self.tls_port,
+                        tlsa_to_remove,
+                        a_to_remove,
+                    ],
+                )
+                dns_agents_tasks[dns_server_id].append(dns_remove_task)
+
+            # this only runs on first run - just make sure remote dns matches what we have - delete any extras, add any missing
+            if rrsets := results.get(
+                "get_agents_dns_records", None
+            ):  # this will only be false if the server didn't respond
+                dns_sync_tasks = await self.sync_dns_server(dns_server_id, rrsets)
+                dns_agents_tasks.update(dns_sync_tasks)
+
+        return dns_agents_tasks
+
+    async def run_once(self):
+        prior_state = deepcopy(self.record_map)
+
+        dns_states, dane_states = await self.get_states()
+
+        self.all_nginx_nodes = set(dane_states)
+        log.info(f"Available Flux Nginx nodes: {self.all_nginx_nodes}")
+
+        # check what state each node is in (see ContainerState enum). Update our records map and build any tasks that are required
+        all_nginx_agent_tasks = await self.task_and_state_resolver(
+            dane_states, self.evaluate_nginx_agent_state
+        )
+        all_pdns_agent_tasks = await self.task_and_state_resolver(
+            dns_states, self.evaluate_pdns_agent_state
+        )
+
+        # Active means node is reachable, has a cert and nginx is serving
+        log.info(f"active Nginx nodes: {self.active_nginx_nodes}")
+
+        # Make sure containers are in running state, if not do configuration tasks to get them running
+        nginx_task_results = await self.danenginx.run_agents_async(
+            targets=all_nginx_agent_tasks
+        )
+        pdns_task_results = await self.dnsdriver.run_agents_async(
+            targets=all_pdns_agent_tasks
+        )
+
+        dns_agents_tasks = await self.resolve_dns_agents_state(pdns_task_results)
+
+        state_diff = self.deep_diff(prior_state, self.record_map)
+        log.info(f"State diff: {pretty_repr(state_diff)}")
+        # implement this
+
+        certs: dict[tuple, str] = {}
+        for agent_id, results in nginx_task_results.items():
+            if cert := results.get("install_nginx_certs", None):
+                certs[agent_id] = cert
+
+        if certs:  # aka change detected
+            # update all dns servers
+
+            # Before ramming the records on the dns server, first check to see if we need to remove this nodes records. (TLSA) It may
+            # have just restarted
+            for dns_server_id, tasks in dns_agents_tasks.items():
+                tasks.extend(
+                    await self.create_records_update_state_task(dns_server_id, certs)
+                )
+
+            nginx_agents_tasks: dict[tuple, list[FluxTask]] = {}
+            for agent_id in certs.keys():
+                # this will reload config if nginx already running
+                nginx_agents_tasks[agent_id] = [
+                    self.danenginx.build_task("start_agents_nginx")
+                ]
+
+            # GATHER
+            await self.danenginx.run_agents_async(targets=nginx_agents_tasks)
+
+        if any(dns_agents_tasks.values()):
+            await self.dnsdriver.run_agents_async(targets=dns_agents_tasks)
+
+        # {('DNSdriver', '116.251.187.92', 'dns_agent'): {('DaneNginx', '162.55.145.76', 'proxy'): {'a': '162.55.145.76'}}}
+        with open(AGENT_ID_TO_TLSA_FILE, "wb") as stream:
+            pickle.dump(self.record_map, stream)
+
+        # shouldn't get in this state... mainly just from testing and things being broken. If things get out of sync, just restart
+        # container. (FluxVault is the primary pid, so exiting process will restart container)
+        rip_targets = {}
+        for agent_id in self.active_nginx_nodes.copy():
+            for dns_server in list(self.record_map):
+                if (
+                    agent_id not in self.record_map[dns_server]["a"]
+                    or agent_id not in self.record_map[dns_server]["tlsa"]
+                ):
+                    log.warning(
+                        f"{agent_id} running but not in record map... restarting container"
+                    )
+                    rip_targets[agent_id] = [
+                        self.danenginx.build_task("commit_seppuku")
+                    ]
+                    self.active_nginx_nodes.remove(agent_id)
+                    # not sure about this... records might still be out of sync, but we need to break here
+                    break
+
+        if any(rip_targets.values()):
+            await self.danenginx.run_agents_async(targets=rip_targets)
+
+        self.first_run = False
+
+        log.info(f"Time since last file sync: {pretty_repr(self.time_since_last_sync)}")
+
     async def run_forever(self):
         await self.danenginx.start_polling_fluxnode_ips()
         # this isn't actually a fluxapp, just a powerdns server running the agent. (see dns_app_config)
         await self.dnsdriver.start_polling_fluxnode_ips()
 
         while True:
-            prior_state = deepcopy(self.record_map)
+            await self.run_once()
 
-            dns_states: dict = await self.dnsdriver.run_agents_async(
-                [self.dnsdriver.build_task("get_agents_state")], stay_connected=True
-            )
-            dane_states: dict = await self.danenginx.run_agents_async(
-                [self.danenginx.build_task("get_agents_state")], stay_connected=True
-            )
-
-            # test what happens if dns not connected, do we just store in record map and wait?
-            log.info(f"DNS states: {pretty_repr(dns_states)}")
-            log.info(f"Nginx states: {pretty_repr(dane_states)}")
-
-            self.all_nginx_nodes = set(dane_states)
-
-            log.info(f"Available Flux Nginx nodes: {self.all_nginx_nodes}")
-
-            # check what state each node is in (see ContainerState enum). Update our records map and build any tasks that are required
-            all_nginx_agent_tasks = await self.task_and_state_resolver(
-                dane_states, self.evaluate_nginx_agent_state
-            )
-            all_pdns_agent_tasks = await self.task_and_state_resolver(
-                dns_states, self.evaluate_pdns_agent_state
-            )
-
-            # Active means node has a cert and nginx is serving
-            log.info(f"active Nginx nodes: {self.active_nginx_nodes}")
-
-            # Make sure containers are in running state, if not do configuration tasks to get them running
-            nginx_task_results = await self.danenginx.run_agents_async(
-                targets=all_nginx_agent_tasks
-            )
-            pdns_task_results = await self.dnsdriver.run_agents_async(
-                targets=all_pdns_agent_tasks
-            )
-
-            # filter powerdns server(s) state for our rrsets, validate against local state (self.record_map)
-            dns_agents_tasks: dict[tuple, list[FluxTask]] = {}
-            for (
-                dns_server_id,
-                results,
-            ) in (
-                pdns_task_results.items()
-            ):  # I've only tested on 1 dns server at a time
-                if dns_server_id not in self.record_map:
-                    self.record_map[dns_server_id] = {"a": {}, "tlsa": {}}
-
-                dns_agents_tasks[dns_server_id]: list[FluxTask] = []
-
-                nodes_to_remove = set()
-                for records_by_type in self.record_map[dns_server_id].values():
-                    for agent_id in list(records_by_type):
-                        if agent_id not in self.all_nginx_nodes:
-                            nodes_to_remove.add(agent_id)
-
-                a_to_remove = tlsa_to_remove = []
-                for node_to_remove in nodes_to_remove:
-                    log.warning(
-                        f"Removing node {node_to_remove} as it's not in All Nginx nodes group"
-                    )
-
-                    self.active_nginx_nodes.discard(node_to_remove)
-
-                    tlsa_to_remove.append(
-                        self.record_map[dns_server_id]["tlsa"].pop(node_to_remove, None)
-                    )
-                    a_to_remove.append(
-                        self.record_map[dns_server_id]["a"].pop(node_to_remove, None)
-                    )
-                    self.uncontactable_count.pop(node_to_remove, None)
-                    # remove from record map, remove from dns, check self.uncontactable_count[agent_id] and remove from there too
-
-                tlsa_to_remove = list(filter(None, tlsa_to_remove))
-                a_to_remove = list(filter(None, a_to_remove))
-
-                if a_to_remove or tlsa_to_remove:
-                    dns_remove_task = self.dnsdriver.build_task(
-                        "remove_agents_dns_records",
-                        [
-                            self.zone_name,
-                            self.tls_port,
-                            tlsa_to_remove,
-                            a_to_remove,
-                        ],
-                    )
-                    dns_agents_tasks[dns_server_id].append(dns_remove_task)
-
-                # this only runs on first run - just make sure remote dns matches what we have - delete any extras, add any missing
-                if rrsets := results.get(
-                    "get_agents_dns_records", None
-                ):  # this will only be false if the server didn't respond
-                    dns_sync_tasks = await self.sync_dns_server(dns_server_id, rrsets)
-                    dns_agents_tasks.update(dns_sync_tasks)
-
-            state_diff = self.deep_diff(prior_state, self.record_map)
-            log.info(f"State diff: {pretty_repr(state_diff)}")
-            # if compare maps(prior, self.record_map)
-            # resolve differences, build tasks
-
-            certs: dict[tuple, str] = {}
-            for agent_id, results in nginx_task_results.items():
-                if cert := results.get("install_nginx_certs", None):
-                    certs[agent_id] = cert
-
-            # pprint(certs)
-            if certs:  # aka change detected
-                # update all dns servers
-
-                # Before ramming the records on the dns server, first check to see if we need to remove this nodes records. (TLSA) It may
-                # have just restarted
-                for dns_server_id, tasks in dns_agents_tasks.items():
-                    tasks.extend(
-                        await self.create_records_update_state_task(
-                            dns_server_id, certs
-                        )
-                    )
-
-                nginx_agents_tasks: dict[tuple, list[FluxTask]] = {}
-                for agent_id in certs.keys():
-                    # this will reload config if nginx already running
-                    nginx_agents_tasks[agent_id] = [
-                        self.danenginx.build_task("start_agents_nginx")
-                    ]
-
-                # GATHER
-                await self.danenginx.run_agents_async(targets=nginx_agents_tasks)
-
-            if any(dns_agents_tasks.values()):
-                await self.dnsdriver.run_agents_async(targets=dns_agents_tasks)
-
-            # {('DNSdriver', '116.251.187.92', 'dns_agent'): {('DaneNginx', '162.55.145.76', 'proxy'): {'a': '162.55.145.76'}}}
-            with open(AGENT_ID_TO_TLSA_FILE, "wb") as stream:
-                pickle.dump(self.record_map, stream)
-
-            # shouldn't get in this state... mainly just from testing and things being broken. If things get out of sync, just restart
-            # container. (FluxVault is the primary pid, so exiting process will restart container)
-            rip_targets = {}
-            for agent_id in self.active_nginx_nodes.copy():
-                for dns_server in list(self.record_map):
-                    if (
-                        agent_id not in self.record_map[dns_server]["a"]
-                        or agent_id not in self.record_map[dns_server]["tlsa"]
-                    ):
-                        log.warning(
-                            f"{agent_id} running but not in record map... restarting container"
-                        )
-                        rip_targets[agent_id] = [
-                            self.danenginx.build_task("commit_seppuku")
-                        ]
-                        self.active_nginx_nodes.remove(agent_id)
-                        # not sure about this... records might still be out of sync, but we need to break here
-                        break
-
-            if any(rip_targets.values()):
-                await self.danenginx.run_agents_async(targets=rip_targets)
-
-            self.first_run = False
-
-            log.info(
-                f"Time since last file sync: {pretty_repr(self.time_since_last_sync)}"
-            )
             log.info(f"Sleeping {CONTACT_SCHEDULE} seconds...")
-
             await asyncio.sleep(CONTACT_SCHEDULE)
 
     async def create_records_update_state_task(
@@ -581,10 +587,10 @@ class DaneRunner:
             tlsa = self.generate_tlsa(cert)
             tlsa_to_add.append(tlsa)
 
-            # Node has just restarted? (Validate this) If this happens, we only need to reload the tlsa, a remains the same
-            if agent_id in self.active_nginx_nodes:
+            if agent_id in self.record_map[dns_server_id]["tlsa"]:
                 tlsa_to_remove.append(self.record_map[dns_server_id]["tlsa"][agent_id])
-            else:
+
+            if not agent_id in self.record_map[dns_server_id]["a"]:
                 a_to_add.append(agent_id[1])
 
             self.record_map[dns_server_id]["tlsa"].update({agent_id: tlsa})
@@ -668,15 +674,22 @@ class DaneRunner:
                 #         pass
 
             case ContainerState.UNCONTACTABLE:
+                retries = self.uncontactable_count.get(agent_id, 0)
+
+                log.warning(f"Node {agent_id} uncontactable. Retries: {retries}")
+
                 # 1 miss + 2 retries
-                if retries := self.uncontactable_count.get(agent_id, 0) >= 2:
+                if retries >= 2:
                     if agent_id in self.active_nginx_nodes:
-                        log.warn(
-                            f"Node {agent_id} has missed 3 contacts... remove from active Nginx nodes"
+                        log.warning(
+                            f"Node {agent_id} has missed 3 contacts... removing from active Nginx nodes"
                         )
-                        self.active_nginx_nodes.remove(agent_id)
+                        self.active_nginx_nodes.discard(agent_id)
                 else:
-                    self.uncontactable_count[agent_id] = retries + 1
+                    if agent_id in self.uncontactable_count:
+                        self.uncontactable_count[agent_id] += 1
+                    else:
+                        self.uncontactable_count[agent_id] = 1
 
             case ContainerState.ERROR:
                 # restart_container. This needs App deployer key so we can login (fix remaining bugs in FluxWallet first)
@@ -685,6 +698,9 @@ class DaneRunner:
             case ContainerState.STOPPED:
                 # only get stopped if we set it (currently we don't)
                 await self.danenginx.disconnect_agent_by_id(agent_id)
+
+            case _:
+                log.warning(f"Unkown container state {state}")
 
         return tasks, time_since_last_sync
 
