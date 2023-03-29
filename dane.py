@@ -284,7 +284,7 @@ class DaneRunner:
                 return k
 
     @staticmethod
-    async def generate_tlsa(cert_bytes: bytes) -> str:
+    def generate_tlsa(cert_bytes: bytes) -> str:
         """Takes a cert, and returns a tlsa record in 3 1 1 format"""
 
         # should be hashing whole cert, not just pubkey
@@ -418,6 +418,7 @@ class DaneRunner:
             log.info(f"Nginx states: {pretty_repr(dane_states)}")
 
             self.all_nginx_nodes = set(dane_states)
+
             log.info(f"Available Flux Nginx nodes: {self.all_nginx_nodes}")
 
             # check what state each node is in (see ContainerState enum). Update our records map and build any tasks that are required
@@ -458,11 +459,37 @@ class DaneRunner:
                         if agent_id not in self.all_nginx_nodes:
                             nodes_to_remove.add(agent_id)
 
+                a_to_remove = tlsa_to_remove = []
                 for node_to_remove in nodes_to_remove:
                     log.warning(
-                        f"TESTING: Would normally remove {node_to_remove} as it's not in All Nginx nodes group"
+                        f"Removing node {node_to_remove} as it's not in All Nginx nodes group"
                     )
+
+                    self.active_nginx_nodes.discard(node_to_remove)
+
+                    tlsa_to_remove.append(
+                        self.record_map[dns_server_id]["tlsa"].pop(node_to_remove, None)
+                    )
+                    a_to_remove.append(
+                        self.record_map[dns_server_id]["a"].pop(node_to_remove, None)
+                    )
+                    self.uncontactable_count.pop(node_to_remove, None)
                     # remove from record map, remove from dns, check self.uncontactable_count[agent_id] and remove from there too
+
+                tlsa_to_remove = list(filter(None, tlsa_to_remove))
+                a_to_remove = list(filter(None, a_to_remove))
+
+                if a_to_remove or tlsa_to_remove:
+                    dns_remove_task = self.dnsdriver.build_task(
+                        "remove_agents_dns_records",
+                        [
+                            self.zone_name,
+                            self.tls_port,
+                            tlsa_to_remove,
+                            a_to_remove,
+                        ],
+                    )
+                    dns_agents_tasks[dns_server_id].append(dns_remove_task)
 
                 # this only runs on first run - just make sure remote dns matches what we have - delete any extras, add any missing
                 if rrsets := results.get(
@@ -543,7 +570,7 @@ class DaneRunner:
             await asyncio.sleep(CONTACT_SCHEDULE)
 
     async def create_records_update_state_task(
-        self, dns_server_id: tuple, certs: dict
+        self, dns_server_id: tuple, certs: dict[tuple, bytes]
     ) -> list[FluxTask]:
         a_to_add = []
         tlsa_to_add = []
@@ -551,7 +578,7 @@ class DaneRunner:
         tasks = []
 
         for agent_id, cert in certs.items():
-            tlsa = await self.generate_tlsa(cert)
+            tlsa = self.generate_tlsa(cert)
             tlsa_to_add.append(tlsa)
 
             # Node has just restarted? (Validate this) If this happens, we only need to reload the tlsa, a remains the same
