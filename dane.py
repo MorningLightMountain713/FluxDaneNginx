@@ -412,15 +412,13 @@ class DaneRunner:
 
         return dns_states, dane_states
 
-    async def resolve_dns_agents_state(
-        self, task_results: dict
+    async def sync_dns_server_to_our_state(
+        self, dns_servers
     ) -> dict[tuple, list[FluxTask]]:
-        # filter powerdns server(s) state for our rrsets, validate against local state (self.record_map)
         dns_agents_tasks: dict[tuple, list[FluxTask]] = {}
-        for (
-            dns_server_id,
-            results,
-        ) in task_results.items():  # I've only tested on 1 dns server at a time
+
+        print(f"DNS Server count: {len(dns_servers)}")
+        for dns_server_id in dns_servers:
             if dns_server_id not in self.record_map:
                 self.record_map[dns_server_id] = {"a": {}, "tlsa": {}}
 
@@ -432,7 +430,9 @@ class DaneRunner:
                     if agent_id not in self.all_nginx_nodes:
                         nodes_to_remove.add(agent_id)
 
-            a_to_remove = tlsa_to_remove = []
+            a_to_remove = []
+            tlsa_to_remove = []
+
             for node_to_remove in nodes_to_remove:
                 log.warning(
                     f"Removing node {node_to_remove} as it's not in All Nginx nodes group"
@@ -463,6 +463,19 @@ class DaneRunner:
                     ],
                 )
                 dns_agents_tasks[dns_server_id].append(dns_remove_task)
+
+        return dns_agents_tasks
+
+    async def resolve_dns_agents_state(
+        self, task_results: dict
+    ) -> dict[tuple, list[FluxTask]]:
+        dns_agents_tasks: dict[tuple, list[FluxTask]] = {}
+        for (
+            dns_server_id,
+            results,
+        ) in task_results.items():  # I've only tested on 1 dns server at a time
+            if dns_server_id not in self.record_map:
+                self.record_map[dns_server_id] = {"a": {}, "tlsa": {}}
 
             # this only runs on first run - just make sure remote dns matches what we have - delete any extras, add any missing
             if rrsets := results.get(
@@ -500,11 +513,17 @@ class DaneRunner:
             targets=all_pdns_agent_tasks
         )
 
+        # atm, this only runs on first run
         dns_agents_tasks = await self.resolve_dns_agents_state(pdns_task_results)
 
+        # this runs every run
+        dns_servers = list(pdns_task_results)
+        dns_agents_tasks.update(await self.sync_dns_server_to_our_state(dns_servers))
+
+        # implement this, just for info right now but should just put this at the end
+        # then slave the dns servers to the diff
         state_diff = self.deep_diff(prior_state, self.record_map)
         log.info(f"State diff: {pretty_repr(state_diff)}")
-        # implement this
 
         certs: dict[tuple, str] = {}
         for agent_id, results in nginx_task_results.items():
