@@ -40,7 +40,7 @@ class RRSet:
 
 
 CONTACT_SCHEDULE = 60  # seconds
-SYNC_OBJECTS_SCHEDULE = 5 * CONTACT_SCHEDULE
+SYNC_OBJECTS_SCHEDULE = 30 * CONTACT_SCHEDULE
 AGENT_ID_TO_TLSA_FILE = Path(".dane_tlsa_address_mapping")
 
 nginx_extensions = FluxVaultExtensions()
