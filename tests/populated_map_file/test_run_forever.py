@@ -41,6 +41,7 @@ KFKFzZENfqhcbSo6cTNSzhtsrFrwJgUe4KQol4NRuaVIlrxTiqRizEvDk+Jvkh9n
 YOBSJibHxZlMmlE2tqRAZB1DQsvA3kXMSIE6EWLkXwGxNTyEKpM5BVWA8lpk
 -----END CERTIFICATE-----"""
 
+# this is generated from the above certificate
 new_tlsa = (
     "3 1 1 C156ED202BC70E942AD0D29D038A6828575D4919E1B44794182AF10511492AF1".lower()
 )
@@ -59,6 +60,12 @@ one_node_missing = {
     ("DaneNginx", "65.108.142.66", "proxy"): {"get_agents_state": "RUNNING"},
 }
 
+one_uncontactable_node = {
+    ("DaneNginx", "66.52.60.249", "proxy"): {},
+    ("DaneNginx", "82.66.5.178", "proxy"): {"get_agents_state": "RUNNING"},
+    ("DaneNginx", "65.108.97.234", "proxy"): {"get_agents_state": "RUNNING"},
+    ("DaneNginx", "65.108.142.66", "proxy"): {"get_agents_state": "RUNNING"},
+}
 
 dns_state = {
     ("DNSDriver", "116.251.187.92", "dns_agent"): {"get_agents_state": "RUNNING"}
@@ -74,7 +81,7 @@ def return_dns_task(*args, **kwargs):
             f.set_result(dns_state)
             return f
 
-    for key, value in kwargs.items():
+    for key in list(kwargs):
         # pretty_repr(f"DNS TASKS FOR {key}: {value}")
         if key == "targets":
             f.set_result(
@@ -150,7 +157,7 @@ def remove_old_tlsa_and_a():
                             "testzone.",
                             33443,
                             [
-                                "3 1 1 c156ed202bc70e942ad0d29d038a6828575d4919e1b44794182af10511492af1"
+                                "3 1 1 d3a6138edd27b42985bdf20270de8b7c15e149404d11dfaf5bbeaa1767505b92"
                             ],
                             ["66.52.60.249"],
                         ],
@@ -222,6 +229,32 @@ def test_default_one_node(dane_already_running, remove_old_tlsa_add_new):
 def test_missing_one_node(dane_already_running, remove_old_tlsa_and_a):
     dane_already_running.danenginx.run_agents_async.side_effect = partial(
         return_nginx_task, one_node_missing
+    )
+
+    asyncio.run(dane_already_running.run_once())
+
+    dane_already_running.dnsdriver.run_agents_async.assert_has_calls(
+        remove_old_tlsa_and_a, any_order=True
+    )
+
+
+def test_uncontactable_one_node(dane_already_running, remove_old_tlsa_and_a):
+    dane_already_running.danenginx.run_agents_async.side_effect = partial(
+        return_nginx_task, one_uncontactable_node
+    )
+
+    asyncio.run(dane_already_running.run_once())
+
+    assert (
+        not remove_old_tlsa_and_a
+        in dane_already_running.dnsdriver.run_agents_async.mock_calls
+    )
+
+    asyncio.run(dane_already_running.run_once())
+
+    assert (
+        not remove_old_tlsa_and_a
+        in dane_already_running.dnsdriver.run_agents_async.mock_calls
     )
 
     asyncio.run(dane_already_running.run_once())

@@ -413,16 +413,22 @@ class DaneRunner:
         return dns_states, dane_states
 
     async def sync_dns_server_to_our_state(
-        self, dns_servers
+        self, dns_servers: list[tuple]
     ) -> dict[tuple, list[FluxTask]]:
         dns_agents_tasks: dict[tuple, list[FluxTask]] = {}
 
-        print(f"DNS Server count: {len(dns_servers)}")
+        # print(f"DNS Server count: {len(dns_servers)}")
         for dns_server_id in dns_servers:
             if dns_server_id not in self.record_map:
                 self.record_map[dns_server_id] = {"a": {}, "tlsa": {}}
 
             dns_agents_tasks[dns_server_id]: list[FluxTask] = []
+
+            # realationship between active node, all nodes, record map
+
+            # All nodes are what we get as input from Flux network
+            # Active nodes SHOULD have a record in map (and be serving)
+            #
 
             nodes_to_remove = set()
             for records_by_type in self.record_map[dns_server_id].values():
@@ -430,12 +436,15 @@ class DaneRunner:
                     if agent_id not in self.all_nginx_nodes:
                         nodes_to_remove.add(agent_id)
 
+            dead_nodes = [k for k, v in self.uncontactable_count.items() if v >= 2]
+            nodes_to_remove.update(dead_nodes)
+
             a_to_remove = []
             tlsa_to_remove = []
 
             for node_to_remove in nodes_to_remove:
                 log.warning(
-                    f"Removing node {node_to_remove} as it's not in All Nginx nodes group"
+                    f"Removing node {node_to_remove} as it's been removed by Flux or it's missed 3 check-ins"
                 )
 
                 self.active_nginx_nodes.discard(node_to_remove)
@@ -708,7 +717,7 @@ class DaneRunner:
                     if agent_id in self.uncontactable_count:
                         self.uncontactable_count[agent_id] += 1
                     else:
-                        self.uncontactable_count[agent_id] = 1
+                        self.uncontactable_count[agent_id] = retries
 
             case ContainerState.ERROR:
                 # restart_container. This needs App deployer key so we can login (fix remaining bugs in FluxWallet first)

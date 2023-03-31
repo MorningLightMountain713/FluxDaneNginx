@@ -5,7 +5,6 @@ record_map_path = Path(".dane_tlsa_address_mapping")
 
 
 def pytest_configure(config):
-    print(config)
     record_map = {
         ("DNSDriver", "116.251.187.92", "dns_agent"): {
             "a": {
